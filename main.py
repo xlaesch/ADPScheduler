@@ -4,10 +4,9 @@ from ortools.sat.python import cp_model
 
 # =============================================================================
 students = []
-student_can_drive = {}        # Map: student name -> boolean
-student_availability = {}     # Map: student name -> { day: set(shifts) }
+student_can_drive = {}        # Map: student name - boolean
+student_availability = {}     # Map: student name - { day: set(shifts) }
 
-# List of all days for which we want to ensure availability
 all_days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
 csv_file = 'processed_student_availability.csv'
@@ -53,13 +52,21 @@ for d in days:
 
     for sh in ["08:00-11:00", "11:00-14:00", "14:00-17:00", "20:00-23:00", "23:00-2:00"]:
         shift_desired[(d, sh)] = 3
-        shift_driver_desired[(d, sh)] = 2  
+        shift_driver_desired[(d, sh)] = 2
+
     if d in ["Tuesday", "Thursday", "Sunday"]:
         shift_desired[(d, "17:00-20:00")] = 0
         shift_driver_desired[(d, "17:00-20:00")] = 0
     else:
         shift_desired[(d, "17:00-20:00")] = 3
         shift_driver_desired[(d, "17:00-20:00")] = 2
+
+    # Remove the shift of 20:00-23:00 and 23:00-2:00 on Thursday, Friday, Saturday
+    if d in ["Thursday", "Friday", "Saturday"]:
+        shift_desired[(d, "20:00-23:00")] = 0
+        shift_driver_desired[(d, "20:00-23:00")] = 0
+        shift_desired[(d, "23:00-2:00")] = 0
+        shift_driver_desired[(d, "23:00-2:00")] = 0
 
 # =============================================================================
 model = cp_model.CpModel()
@@ -168,8 +175,7 @@ if status in (cp_model.FEASIBLE, cp_model.OPTIMAL):
                 num_assigned = solver.Value(assigned_sum[(d, sh)])
                 slack_val = solver.Value(slack[(d, sh)])
                 missing_val = solver.Value(missing[(d, sh)])
-                print(f"  Shift {sh}: assigned {num_assigned} (ideal 3); missing penalty {missing_val}, slack {slack_val}.")
-                print("      ", ", ".join(assigned_students))
+                print(f"  Shift {sh}: {', '.join(assigned_students)}")
             else:
                 print(f"  Shift {sh}: {', '.join(assigned_students)}")
         print()
