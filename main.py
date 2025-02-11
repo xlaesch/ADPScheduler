@@ -90,11 +90,16 @@ for s in students:
 days = list(shifts_per_day.keys())
 for i in range(len(days) - 1):
     for s in students:
-        # At least one of the two consecutive night shift assignments must be off.
         model.AddBoolOr([
             schedule[(s["name"], days[i], "2-8 (Night)")].Not(),
             schedule[(s["name"], days[i+1], "2-8 (Night)")].Not()
         ])
+
+# NEW: Add maximum staffing constraints for each shift.
+for day, shifts in shifts_per_day.items():
+    for shift in shifts:
+        cap = 2 if shift == "2-8 (Night)" else 3
+        model.Add(sum(schedule[(s["name"], day, shift)] for s in students) <= cap)
 
 # Set the objective to balance fairness and penalize unmet shift requirements.
 penalty_weight = 10  # Adjust weight as needed.
@@ -107,14 +112,22 @@ model.Minimize(
 solver = cp_model.CpSolver()
 status = solver.Solve(model)
 
-# Output schedule
+# Output schedule with an additional column for drivers.
 schedule_result = []
 for day, shifts in shifts_per_day.items():
     for shift in shifts:
         assigned_students = [
             s["name"] for s in students if solver.Value(schedule[(s["name"], day, shift)]) == 1
         ]
-        schedule_result.append({"Day": day, "Shift": shift, "Assigned": ", ".join(assigned_students)})
+        assigned_drivers = [
+            s["name"] for s in students if solver.Value(schedule[(s["name"], day, shift)]) == 1 and s["can_drive"]
+        ]
+        schedule_result.append({
+            "Day": day,
+            "Shift": shift,
+            "Assigned": ", ".join(assigned_students),
+            "Drivers": ", ".join(assigned_drivers)
+        })
 
 # Convert to DataFrame for viewing
 df = pd.DataFrame(schedule_result)
