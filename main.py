@@ -51,24 +51,57 @@ for student in students:
         for shift in shifts:
             schedule[(student["name"], day, shift)] = model.NewBoolVar(f"{student['name']}_{day}_{shift}")
 
-# Shift constraints: Ensure best effort to fill shifts
+# Replace strict shift constraints with soft constraints using slack variables.
+slack_avail = {}
+slack_drivers = {}
 for day, shifts in shifts_per_day.items():
     for shift in shifts:
         available_students = [s for s in students if shift in s["availability"].get(day, [])]
-        min_needed = min(len(available_students), shift_requirements[shift]["needed"])
-        min_drivers = min(sum(s["can_drive"] for s in available_students), shift_requirements[shift]["drivers"])
-        
+        slack_avail[(day, shift)] = model.NewIntVar(0, shift_requirements[shift]["needed"], f"slack_avail_{day}_{shift}")
+        slack_drivers[(day, shift)] = model.NewIntVar(0, shift_requirements[shift]["drivers"], f"slack_driver_{day}_{shift}")
         model.Add(
-            sum(schedule[(s["name"], day, shift)] for s in available_students) >= min_needed
+            sum(schedule[(s["name"], day, shift)] for s in available_students) + slack_avail[(day, shift)]
+            >= shift_requirements[shift]["needed"]
         )
         model.Add(
-            sum(schedule[(s["name"], day, shift)] for s in available_students if s["can_drive"]) >= min_drivers
+            sum(schedule[(s["name"], day, shift)] for s in available_students if s["can_drive"]) + slack_drivers[(day, shift)]
+            >= shift_requirements[shift]["drivers"]
         )
 
-# Rotate night shift workers (no two consecutive nights)
-for i, day in enumerate(shifts_per_day.keys()):
-    model.Add(schedule[(night_shift_schedule[i], day, "2-8 (Night)")] == 1)
-    model.Add(schedule[(night_shift_schedule[i + 1], day, "2-8 (Night)")] == 1)
+# Fairness: calculate each student's total assigned shifts.
+# Compute an upper bound: maximum possible shifts per student = #days * max shifts per day.
+upper_bound = len(shifts_per_day) * max(len(shifts) for shifts in shifts_per_day.values())
+student_load = {}
+for s in students:
+    student_load[s["name"]] = model.NewIntVar(0, upper_bound, f"load_{s['name']}")
+    model.Add(
+        student_load[s["name"]] ==
+        sum(schedule[(s["name"], day, shift)] for day in shifts_per_day for shift in shifts_per_day[day])
+    )
+
+# Define max and min load variables.
+max_load = model.NewIntVar(0, upper_bound, "max_load")
+min_load = model.NewIntVar(0, upper_bound, "min_load")
+for s in students:
+    model.Add(student_load[s["name"]] <= max_load)
+    model.Add(student_load[s["name"]] >= min_load)
+
+# Prevent any student from working consecutive night shifts ("2-8 (Night)")
+days = list(shifts_per_day.keys())
+for i in range(len(days) - 1):
+    for s in students:
+        # At least one of the two consecutive night shift assignments must be off.
+        model.AddBoolOr([
+            schedule[(s["name"], days[i], "2-8 (Night)")].Not(),
+            schedule[(s["name"], days[i+1], "2-8 (Night)")].Not()
+        ])
+
+# Set the objective to balance fairness and penalize unmet shift requirements.
+penalty_weight = 10  # Adjust weight as needed.
+model.Minimize(
+    (max_load - min_load) +
+    penalty_weight * (sum(slack_avail.values()) + sum(slack_drivers.values()))
+)
 
 # Solve model
 solver = cp_model.CpSolver()
@@ -85,4 +118,9 @@ for day, shifts in shifts_per_day.items():
 
 # Convert to DataFrame for viewing
 df = pd.DataFrame(schedule_result)
-print(df)
+
+# Save DataFrame to an Excel file
+output_file_path = "schedule_output.xlsx"
+df.to_excel(output_file_path, index=False)
+
+print(f"Schedule saved to {output_file_path}")
