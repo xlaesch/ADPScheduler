@@ -1,225 +1,282 @@
+import csv
+import ast
 from ortools.sat.python import cp_model
-import pandas as pd
-import random
 
-# Load processed student availability data from CSV
-csv_file_path = "processed_student_availability.csv"
-students_df = pd.read_csv(csv_file_path)
-
-def convert_slot(slot):
-    mapping = {
-        "8-11": "08:00-11:00",
-        "11-2": "11:00-14:00",
-        "2-5": "14:00-17:00",
-        "5-8": "17:00-20:00",
-        "2-8 (Night)": "02:00-08:00 (Night)"
-    }
-    return mapping.get(slot, slot)
-
-# Convert DataFrame to structured dictionary with converted time formats
+# =============================================================================
+# 1. Read and parse the CSV file containing student availabilities.
+#
+# For each student, we assume that the CSV lists the shifts when the student
+# is available (i.e. not in class). However, if the shifts "20:00-23:00" and 
+# "23:00-2:00" are missing, we add them—assuming that all students are available 
+# during those times.
+# =============================================================================
 students = []
-for _, row in students_df.iterrows():
-    availability = eval(row["availability"])  # Convert string representation of dict back to dict
-    converted_availability = {}
-    for day, slots in availability.items():
-        converted_availability[day] = [convert_slot(slot) for slot in slots]
-    students.append({
-        "name": row["name"],
-        "can_drive": row["can_drive"],
-        "availability": converted_availability
-    })
+student_can_drive = {}        # Map: student name -> boolean
+student_availability = {}     # Map: student name -> { day: set(shifts) }
 
-# Define shifts per day using 24h time
-shifts_per_day = {
-    "Monday": ["08:00-11:00", "11:00-14:00", "14:00-17:00", "17:00-20:00", "20:00-23:00", "23:00-02:00", "02:00-08:00 (Night)"],
-    "Tuesday": ["08:00-11:00", "11:00-14:00", "14:00-17:00", "17:00-20:00", "20:00-23:00", "23:00-02:00", "02:00-08:00 (Night)"],
-    "Wednesday": ["08:00-11:00", "11:00-14:00", "14:00-17:00", "17:00-20:00", "20:00-23:00", "23:00-02:00", "02:00-08:00 (Night)"],
-    "Thursday": ["08:00-11:00", "11:00-14:00", "14:00-17:00", "17:00-20:00", "20:00-23:00", "23:00-02:00", "02:00-08:00 (Night)"],
-    "Friday": ["08:00-11:00", "11:00-14:00", "14:00-17:00", "17:00-20:00", "20:00-23:00", "23:00-02:00", "02:00-08:00 (Night)"],
-    "Saturday": ["08:00-11:00", "11:00-14:00", "14:00-17:00", "17:00-20:00", "20:00-23:00", "23:00-02:00", "02:00-08:00 (Night)"],
-    "Sunday": ["08:00-11:00", "11:00-14:00", "14:00-17:00", "17:00-20:00", "20:00-23:00", "23:00-02:00", "02:00-08:00 (Night)"],
-}
+# List of all days for which we want to ensure availability
+all_days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
-# Define updated shift requirements per shift label.
-shift_requirements = {
-    "08:00-11:00": {"needed": 3, "drivers": 2},
-    "11:00-14:00": {"needed": 3, "drivers": 2},
-    "14:00-17:00": {"needed": 3, "drivers": 2},
-    "17:00-20:00": {"needed": 3, "drivers": 2},
-    "20:00-23:00": {"needed": 3, "drivers": 2},
-    "23:00-02:00": {"needed": 3, "drivers": 2},
-    "02:00-08:00 (Night)": {"needed": 2, "drivers": 1},  # Rotating night shift requirement
-}
+csv_file = 'processed_student_availability.csv'
+with open(csv_file, newline='') as f:
+    reader = csv.DictReader(f)
+    for row in reader:
+        name = row['name'].strip()
+        students.append(name)
+        student_can_drive[name] = row['can_drive'].strip().lower() == 'true'
+        # Parse the availability dictionary stored as a string.
+        try:
+            avail_dict = ast.literal_eval(row['availability'])
+        except Exception as e:
+            print(f"Error parsing availability for {name}: {e}")
+            avail_dict = {}
+        avail_clean = {}
+        # Process each day in the CSV (if any)
+        for day, shift_list in avail_dict.items():
+            # Remove duplicates by converting to a set.
+            avail_clean[day] = set(shift_list)
+            # Ensure that the missing evening shifts are added.
+            avail_clean[day].update(["20:00-23:00", "23:00-2:00"])
+        # Also, for any day missing from the CSV, assume the student is available
+        # for the evening shifts.
+        for day in all_days:
+            if day not in avail_clean:
+                avail_clean[day] = {"20:00-23:00", "23:00-2:00"}
+        student_availability[name] = avail_clean
 
-# Initialize model
+# =============================================================================
+# 2. Define days, shifts, and per-shift "desired" requirements.
+#
+# We now have seven shifts per day:
+#   - "02:00-08:00": The special night shift; hard-constrained to 2 workers.
+#   - "08:00-11:00", "11:00-14:00", "14:00-17:00", "17:00-20:00",
+#     "20:00-23:00", "23:00-2:00": Regular 3-hour shifts.
+#
+# For the regular shifts, the ideal coverage is 3 workers (with at least 2 drivers)
+# but if needed, 2 workers (with at least 1 driver) can be used.
+#
+# Also, on Tuesday, Thursday, and Sunday the "17:00-20:00" shift is off.
+# =============================================================================
+days = all_days
+
+shifts = [
+    "02:00-08:00",  # Night shift: fixed to 2 assignments.
+    "08:00-11:00",
+    "11:00-14:00",
+    "14:00-17:00",
+    "17:00-20:00",  # Off on Tue, Thu, and Sun.
+    "20:00-23:00",
+    "23:00-2:00"
+]
+
+# Define the "desired" coverage for each (day, shift)
+shift_desired = {}
+shift_driver_desired = {}  # Desired driver count when fully staffed.
+for d in days:
+    # Night shift:
+    shift_desired[(d, "02:00-08:00")] = 2
+    shift_driver_desired[(d, "02:00-08:00")] = 1
+
+    # Regular 3-hour shifts:
+    for sh in ["08:00-11:00", "11:00-14:00", "14:00-17:00", "20:00-23:00", "23:00-2:00"]:
+        shift_desired[(d, sh)] = 3
+        shift_driver_desired[(d, sh)] = 2  # When fully staffed.
+    # The "17:00-20:00" shift:
+    if d in ["Tuesday", "Thursday", "Sunday"]:
+        shift_desired[(d, "17:00-20:00")] = 0
+        shift_driver_desired[(d, "17:00-20:00")] = 0
+    else:
+        shift_desired[(d, "17:00-20:00")] = 3
+        shift_driver_desired[(d, "17:00-20:00")] = 2
+
+# =============================================================================
+# 3. Create the CP-SAT model and decision variables.
+#
+# A binary decision variable is created for each (student, day, shift)
+# if the student is available.
+# =============================================================================
 model = cp_model.CpModel()
 
-# Decision variables: now each decision variable is keyed by (student, day, shift_index, shift_label)
-schedule = {}
-for student in students:
-    for day, shift_list in shifts_per_day.items():
-        for idx, shift in enumerate(shift_list):
-            schedule[(student["name"], day, idx, shift)] = model.NewBoolVar(
-                f"{student['name']}_{day}_{shift}_{idx}"
-            )
-
-# For each student, day, and shift instance, force schedule to 0 if the student is not available.
-for student in students:
-    for day, shift_list in shifts_per_day.items():
-        available_shifts = student["availability"].get(day, [])
-        for idx, shift in enumerate(shift_list):
-            if shift not in available_shifts:
-                model.Add(schedule[(student["name"], day, idx, shift)] == 0)
-
-# Slack variables for soft constraints on meeting required available and driver counts.
-slack_avail = {}
-slack_drivers = {}
-for day, shift_list in shifts_per_day.items():
-    for idx, shift in enumerate(shift_list):
-        # Students available to work this shift instance on that day:
-        available_students = [s for s in students if shift in s["availability"].get(day, [])]
-        slack_avail[(day, idx, shift)] = model.NewIntVar(0, shift_requirements[shift]["needed"],
-                                                           f"slack_avail_{day}_{shift}_{idx}")
-        slack_drivers[(day, idx, shift)] = model.NewIntVar(0, shift_requirements[shift]["drivers"],
-                                                             f"slack_driver_{day}_{shift}_{idx}")
-        model.Add(
-            sum(schedule[(s["name"], day, idx, shift)] for s in available_students) + slack_avail[(day, idx, shift)]
-            >= shift_requirements[shift]["needed"]
-        )
-        model.Add(
-            sum(schedule[(s["name"], day, idx, shift)] for s in available_students if s["can_drive"])
-            + slack_drivers[(day, idx, shift)]
-            >= shift_requirements[shift]["drivers"]
-        )
-
-# Fairness: calculate each student's total assigned shifts across all days and shift instances.
-upper_bound = len(shifts_per_day) * max(len(shift_list) for shift_list in shifts_per_day.values())
-student_load = {}
+assignment = {}  # (s, d, sh) -> BoolVar
 for s in students:
-    student_load[s["name"]] = model.NewIntVar(0, upper_bound, f"load_{s['name']}")
-    model.Add(
-        student_load[s["name"]] ==
-        sum(schedule[(s["name"], day, idx, shift)]
-            for day, shift_list in shifts_per_day.items()
-            for idx, shift in enumerate(shift_list))
-    )
+    for d in days:
+        for sh in shifts:
+            # For the evening shifts ("20:00-23:00" and "23:00-2:00"), we now assume
+            # availability even if not present in the CSV.
+            if sh in ["20:00-23:00", "23:00-2:00"]:
+                available = True
+            else:
+                available = (d in student_availability[s] and sh in student_availability[s][d])
+            if available:
+                assignment[(s, d, sh)] = model.NewBoolVar(f"{s}_{d}_{sh}")
 
-max_load = model.NewIntVar(0, upper_bound, "max_load")
-min_load = model.NewIntVar(0, upper_bound, "min_load")
+# =============================================================================
+# 4. Coverage constraints & soft relaxation.
+#
+# For each (day, shift):
+#   - For the night shift ("02:00-08:00"): enforce exactly 2 assignments.
+#   - For off shifts (desired = 0): enforce 0 assignments.
+#   - For every other (regular) shift, allow between 0 and 3 assignments.
+#
+# For regular shifts we also define:
+#   - assigned_sum[(d,sh)] = total number of workers assigned.
+#   - slack[(d,sh)] = 3 - assigned_sum (penalty for missing full coverage).
+#   - missing[(d,sh)] = max(0, 2 - assigned_sum) (extra penalty if fewer than 2 are assigned).
+# =============================================================================
+assigned_sum = {}  # (d,sh) -> IntVar (number of workers assigned)
+slack = {}       # (d,sh) -> IntVar: 3 - assigned_sum.
+missing = {}     # (d,sh) -> IntVar: max(0, 2 - assigned_sum).
+
+for d in days:
+    for sh in shifts:
+        vars_for_shift = [assignment[(s, d, sh)] for s in students if (s, d, sh) in assignment]
+        if sh == "02:00-08:00":
+            model.Add(sum(vars_for_shift) == shift_desired[(d, sh)])
+        elif shift_desired[(d, sh)] == 0:
+            model.Add(sum(vars_for_shift) == 0)
+        else:
+            model.Add(sum(vars_for_shift) <= 3)
+            assigned_sum[(d, sh)] = model.NewIntVar(0, 3, f"assigned_{d}_{sh}")
+            model.Add(assigned_sum[(d, sh)] == sum(vars_for_shift))
+            slack[(d, sh)] = model.NewIntVar(0, 3, f"slack_{d}_{sh}")
+            model.Add(slack[(d, sh)] == 3 - assigned_sum[(d, sh)])
+            missing[(d, sh)] = model.NewIntVar(0, 2, f"missing_{d}_{sh}")
+            model.AddMaxEquality(missing[(d, sh)], [2 - assigned_sum[(d, sh)], 0])
+
+# =============================================================================
+# 5. Driver constraints.
+#
+# For every shift, compute the sum over drivers.
+# For:
+#   - Night shifts: require at least 1 driver.
+#   - Regular shifts: if any worker is assigned then at least 1 driver;
+#     and if fully staffed (3) then at least 2 drivers.
+# =============================================================================
+for d in days:
+    for sh in shifts:
+        driver_vars = [assignment[(s, d, sh)] for s in students 
+                       if (s, d, sh) in assignment and student_can_drive[s]]
+        if sh == "02:00-08:00":
+            model.Add(sum(driver_vars) >= 1)
+        elif shift_desired[(d, sh)] == 0:
+            pass  # Off shift; no workers assigned.
+        else:
+            if (d, sh) in assigned_sum:
+                nonempty = model.NewBoolVar(f"nonempty_{d}_{sh}")
+                model.Add(assigned_sum[(d, sh)] >= 1).OnlyEnforceIf(nonempty)
+                model.Add(assigned_sum[(d, sh)] == 0).OnlyEnforceIf(nonempty.Not())
+                model.Add(sum(driver_vars) >= 1).OnlyEnforceIf(nonempty)
+                full = model.NewBoolVar(f"full_{d}_{sh}")
+                model.Add(assigned_sum[(d, sh)] == 3).OnlyEnforceIf(full)
+                model.Add(assigned_sum[(d, sh)] != 3).OnlyEnforceIf(full.Not())
+                model.Add(sum(driver_vars) >= 2).OnlyEnforceIf(full)
+
+# =============================================================================
+# 6. Night shift frequency.
+#
+# Each student may work the "02:00-08:00" shift at most once per week.
+# =============================================================================
 for s in students:
-    model.Add(student_load[s["name"]] <= max_load)
-    model.Add(student_load[s["name"]] >= min_load)
+    night_vars = [assignment[(s, d, "02:00-08:00")] for d in days if (s, d, "02:00-08:00") in assignment]
+    if night_vars:
+        model.Add(sum(night_vars) <= 1)
 
-# Prevent any student from working consecutive night shifts ("02:00-08:00 (Night)")
-# For each student and consecutive days, the sum of assignments over all night shift instances is <= 1.
-days = list(shifts_per_day.keys())
-for i in range(len(days) - 1):
-    day1 = days[i]
-    day2 = days[i+1]
-    # Get indices (could be more than one occurrence of night shift per day)
-    night_indices_day1 = [idx for idx, shift in enumerate(shifts_per_day[day1]) if shift == "02:00-08:00 (Night)"]
-    night_indices_day2 = [idx for idx, shift in enumerate(shifts_per_day[day2]) if shift == "02:00-08:00 (Night)"]
-    for s in students:
-        assignments_day1 = [schedule[(s["name"], day1, idx, "02:00-08:00 (Night)")] for idx in night_indices_day1]
-        assignments_day2 = [schedule[(s["name"], day2, idx, "02:00-08:00 (Night)")] for idx in night_indices_day2]
-        model.Add(sum(assignments_day1) + sum(assignments_day2) <= 1)
-
-# NEW: Add maximum staffing constraints for each shift instance.
-for day, shift_list in shifts_per_day.items():
-    for idx, shift in enumerate(shift_list):
-        cap = 2 if shift == "02:00-08:00 (Night)" else 3
-        model.Add(sum(schedule[(s["name"], day, idx, shift)] for s in students) <= cap)
-
-# Ensure each student gets at most one shift per day.
+# =============================================================================
+# 7. Fairness constraints.
+#
+# For each student, compute the total number of shifts assigned.
+# Then define global variables for the maximum and minimum shifts any student gets.
+# =============================================================================
+max_possible_shifts = len(days) * len(shifts)
+total_shifts = {}
 for s in students:
-    for day, shift_list in shifts_per_day.items():
-        model.Add(sum(schedule[(s["name"], day, idx, shift)]
-                      for idx, shift in enumerate(shift_list)) <= 1)
+    rel_vars = [assignment[(s, d, sh)] for d in days for sh in shifts if (s, d, sh) in assignment]
+    total_shifts[s] = model.NewIntVar(0, max_possible_shifts, f"total_shifts_{s}")
+    model.Add(total_shifts[s] == sum(rel_vars))
 
-# Set objective: balance fairness and penalize unmet requirements.
-penalty_weight = 10  # Adjust weight as needed.
-model.Minimize(
-    (max_load - min_load) +
-    penalty_weight * (sum(slack_avail.values()) + sum(slack_drivers.values()))
-)
+max_shifts = model.NewIntVar(0, max_possible_shifts, "max_shifts")
+min_shifts = model.NewIntVar(0, max_possible_shifts, "min_shifts")
+for s in students:
+    model.Add(total_shifts[s] <= max_shifts)
+    model.Add(total_shifts[s] >= min_shifts)
 
-# Solve model with a time limit.
+# =============================================================================
+# 8. Define the objective.
+#
+# We want to (a) minimize the staffing penalties on regular shifts and (b)
+# minimize the difference between the busiest and least busy student.
+#
+# For each regular shift (desired = 3), we add:
+#   penalty = 10000 * missing + 1000 * slack
+#
+# Then we add the fairness term.
+# =============================================================================
+coverage_penalty_terms = []
+for d in days:
+    for sh in shifts:
+        if sh != "02:00-08:00" and shift_desired[(d, sh)] > 0:
+            coverage_penalty_terms.append(10000 * missing[(d, sh)] + 1000 * slack[(d, sh)])
+
+fairness_term = max_shifts - min_shifts
+model.Minimize(sum(coverage_penalty_terms) + fairness_term)
+
+# =============================================================================
+# 9. Solve the model.
+# =============================================================================
 solver = cp_model.CpSolver()
-solver.parameters.max_time_in_seconds = 60  # 60-second time limit.
-solver.parameters.log_search_progress = True
 status = solver.Solve(model)
 
-# Output schedule with an additional column for drivers.
-schedule_result = []
-for day, shift_list in shifts_per_day.items():
-    for idx, shift in enumerate(shift_list):
-        assigned_students = [
-            s["name"] for s in students if solver.Value(schedule[(s["name"], day, idx, shift)]) == 1
-        ]
-        assigned_drivers = [
-            s["name"] for s in students if solver.Value(schedule[(s["name"], day, idx, shift)]) == 1 and s["can_drive"]
-        ]
-        schedule_result.append({
-            "Day": day,
-            "Shift": shift,
-            "Instance": idx,
-            "Assigned": ", ".join(assigned_students),
-            "Drivers": ", ".join(assigned_drivers)
-        })
-
-# Convert to DataFrame for viewing and save to Excel.
-df = pd.DataFrame(schedule_result)
-output_file_path = "schedule_output.xlsx"
-df.to_excel(output_file_path, index=False)
-
-print(f"Schedule saved to {output_file_path}")
-
-# New: Check for scheduling conflicts
-import pandas as pd
-
-conflicts = []
-
-# Load students availability from CSV into a lookup dictionary.
-students_avail_df = pd.read_csv("processed_student_availability.csv")
-availability_lookup = {}
-for _, row in students_avail_df.iterrows():
-    # Convert the string representation back to a dictionary.
-    availability_lookup[row["name"]] = eval(row["availability"])
-
-# Load the generated schedule from Excel.
-schedule_df = pd.read_excel("schedule_output.xlsx")
-
-# Check for class conflicts (student assigned when not available)
-for _, row in schedule_df.iterrows():
-    day = row["Day"]
-    shift = row["Shift"]
-    assigned = row["Assigned"]
-    if pd.isna(assigned) or assigned.strip() == "":
-        continue
-    # Split the assigned students from the generated schedule.
-    assigned_students = [s.strip() for s in assigned.split(",") if s.strip()]
-    for student in assigned_students:
-        if shift not in availability_lookup.get(student, {}).get(day, []):
-            conflicts.append(f"Conflict: {student} assigned to shift {shift} on {day} but not available (might be in class).")
-
-# Check that no student is assigned more than one shift in the same day.
-# We'll aggregate assignments per day.
-for day, group in schedule_df.groupby("Day"):
-    daily_assignments = {}
-    for _, row in group.iterrows():
-        assigned = row["Assigned"]
-        if pd.isna(assigned) or assigned.strip() == "":
-            continue
-        assigned_students = [s.strip() for s in assigned.split(",") if s.strip()]
-        for student in assigned_students:
-            daily_assignments[student] = daily_assignments.get(student, 0) + 1
-            if daily_assignments[student] > 1:
-                conflicts.append(f"Conflict: {student} has more than one shift on {day}.")
-
-if conflicts:
-    print("\nScheduling Conflicts Detected:")
-    for conflict in conflicts:
-        print(conflict)
+if status in (cp_model.FEASIBLE, cp_model.OPTIMAL):
+    print("Shift Schedule:\n")
+    for d in days:
+        print(f"=== {d} ===")
+        for sh in shifts:
+            if shift_desired[(d, sh)] == 0:
+                continue  # Skip off shifts.
+            assigned_students = []
+            for s in students:
+                key = (s, d, sh)
+                if key in assignment and solver.Value(assignment[key]) == 1:
+                    marker = " (D)" if student_can_drive[s] else ""
+                    assigned_students.append(s + marker)
+            if sh != "02:00-08:00" and shift_desired[(d, sh)] > 0 and (d, sh) in assigned_sum:
+                num_assigned = solver.Value(assigned_sum[(d, sh)])
+                slack_val = solver.Value(slack[(d, sh)])
+                missing_val = solver.Value(missing[(d, sh)])
+                print(f"  Shift {sh}: assigned {num_assigned} (ideal 3); missing penalty {missing_val}, slack {slack_val}.")
+                print("      ", ", ".join(assigned_students))
+            else:
+                print(f"  Shift {sh}: {', '.join(assigned_students)}")
+        print()
+    print("Fairness Summary:")
+    for s in students:
+        print(f"  {s}: {solver.Value(total_shifts[s])} shifts")
+    print(f"  Maximum shifts assigned: {solver.Value(max_shifts)}")
+    print(f"  Minimum shifts assigned: {solver.Value(min_shifts)}")
+    print("\nObjective value:", solver.ObjectiveValue())
 else:
-    print("\nNo scheduling conflicts detected.")
+    print("No feasible solution was found.")
 
+# =============================================================================
+# 10. Checker: Verify no scheduling conflicts.
+#
+# This function checks that every scheduled shift is among the student's available
+# times (which now, by design, always includes the evening shifts).
+# =============================================================================
+def check_schedule_conflicts(solver, assignment, students, days, shifts, student_availability):
+    conflicts = []
+    for s in students:
+        for d in days:
+            for sh in shifts:
+                key = (s, d, sh)
+                if key in assignment and solver.Value(assignment[key]) == 1:
+                    if d not in student_availability[s] or sh not in student_availability[s][d]:
+                        conflicts.append((s, d, sh))
+    if conflicts:
+        print("\nScheduling conflicts found:")
+        for (s, d, sh) in conflicts:
+            print(f"  Student {s} is scheduled for shift {sh} on {d} but is not available (conflict with class).")
+    else:
+        print("\nNo scheduling conflicts found.")
+
+check_schedule_conflicts(solver, assignment, students, days, shifts, student_availability)
