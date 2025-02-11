@@ -129,6 +129,12 @@ for s in students:
     if night_vars:
         model.Add(sum(night_vars) <= 1)
 
+# Add this constraint so each student has at most one shift per day
+for s in students:
+    for d in days:
+        day_vars = [assignment[(s, d, sh)] for sh in shifts if (s, d, sh) in assignment]
+        model.Add(sum(day_vars) <= 1)
+
 # =============================================================================
 max_possible_shifts = len(days) * len(shifts)
 total_shifts = {}
