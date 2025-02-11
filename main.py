@@ -26,11 +26,11 @@ shifts_per_day = {
 # Define shift requirements
 shift_requirements = {
     "8-11": {"needed": 3, "drivers": 2},
-    "11-2": {"needed": 3, "drivers": 2},
+    "11-2": {"needed": 2, "drivers": 1},
     "2-5": {"needed": 3, "drivers": 2},
     "5-8": {"needed": 3, "drivers": 2},
     "8-11": {"needed": 3, "drivers": 2},
-    "11-2": {"needed": 3, "drivers": 2},
+    "11-2": {"needed": 2, "drivers": 1},
     "2-8 (Night)": {"needed": 2, "drivers": 1},  # Rotating night shift
 }
 
@@ -51,16 +51,18 @@ for student in students:
         for shift in shifts:
             schedule[(student["name"], day, shift)] = model.NewBoolVar(f"{student['name']}_{day}_{shift}")
 
-# Shift constraints: Ensure enough workers and drivers
+# Shift constraints: Ensure best effort to fill shifts
 for day, shifts in shifts_per_day.items():
     for shift in shifts:
+        available_students = [s for s in students if shift in s["availability"].get(day, [])]
+        min_needed = min(len(available_students), shift_requirements[shift]["needed"])
+        min_drivers = min(sum(s["can_drive"] for s in available_students), shift_requirements[shift]["drivers"])
+        
         model.Add(
-            sum(schedule[(s["name"], day, shift)] for s in students if shift in s["availability"].get(day, []))
-            == shift_requirements[shift]["needed"]
+            sum(schedule[(s["name"], day, shift)] for s in available_students) >= min_needed
         )
         model.Add(
-            sum(schedule[(s["name"], day, shift)] for s in students if s["can_drive"] and shift in s["availability"].get(day, []))
-            >= shift_requirements[shift]["drivers"]
+            sum(schedule[(s["name"], day, shift)] for s in available_students if s["can_drive"]) >= min_drivers
         )
 
 # Rotate night shift workers (no two consecutive nights)
@@ -73,17 +75,14 @@ solver = cp_model.CpSolver()
 status = solver.Solve(model)
 
 # Output schedule
-if status == cp_model.FEASIBLE or status == cp_model.OPTIMAL:
-    schedule_result = []
-    for day, shifts in shifts_per_day.items():
-        for shift in shifts:
-            assigned_students = [
-                s["name"] for s in students if solver.Value(schedule[(s["name"], day, shift)]) == 1
-            ]
-            schedule_result.append({"Day": day, "Shift": shift, "Assigned": ", ".join(assigned_students)})
-    
-    # Convert to DataFrame for viewing
-    df = pd.DataFrame(schedule_result)
-    print(df)
-else:
-    print("No feasible schedule found.")
+schedule_result = []
+for day, shifts in shifts_per_day.items():
+    for shift in shifts:
+        assigned_students = [
+            s["name"] for s in students if solver.Value(schedule[(s["name"], day, shift)]) == 1
+        ]
+        schedule_result.append({"Day": day, "Shift": shift, "Assigned": ", ".join(assigned_students)})
+
+# Convert to DataFrame for viewing
+df = pd.DataFrame(schedule_result)
+print(df)
