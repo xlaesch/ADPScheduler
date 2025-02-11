@@ -110,6 +110,8 @@ model.Minimize(
 
 # Solve model
 solver = cp_model.CpSolver()
+solver.parameters.max_time_in_seconds = 60  # Limits the solve time to 60 seconds.
+solver.parameters.log_search_progress = True
 status = solver.Solve(model)
 
 # Output schedule with an additional column for drivers.
