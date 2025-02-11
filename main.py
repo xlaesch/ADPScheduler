@@ -6,30 +6,49 @@ import random
 csv_file_path = "processed_student_availability.csv"
 students_df = pd.read_csv(csv_file_path)
 
-# Convert DataFrame to structured dictionary
+def convert_slot(slot):
+    mapping = {
+        "8-11": "08:00-11:00",
+        "11-2": "11:00-14:00",
+        "2-5": "14:00-17:00",
+        "5-8": "17:00-20:00",
+        "2-8 (Night)": "02:00-08:00 (Night)"
+    }
+    return mapping.get(slot, slot)
+
+# Convert DataFrame to structured dictionary with converted time formats
 students = []
 for _, row in students_df.iterrows():
     availability = eval(row["availability"])  # Convert string representation of dict back to dict
-    students.append({"name": row["name"], "can_drive": row["can_drive"], "availability": availability})
+    converted_availability = {}
+    for day, slots in availability.items():
+        converted_availability[day] = [convert_slot(slot) for slot in slots]
+    students.append({
+        "name": row["name"],
+        "can_drive": row["can_drive"],
+        "availability": converted_availability
+    })
 
-# Define shifts per day (each entry in the list is a distinct shift instance)
+# Define shifts per day using 24h time
 shifts_per_day = {
-    "Monday": ["8-11", "11-2", "2-5", "5-8", "8-11", "11-2", "2-8 (Night)"],
-    "Tuesday": ["8-11", "11-2", "2-5", "8-11", "11-2", "2-8 (Night)"],
-    "Wednesday": ["8-11", "11-2", "2-5", "5-8", "8-11", "11-2", "2-8 (Night)"],
-    "Thursday": ["8-11", "11-2", "2-5", "8-11", "11-2", "2-8 (Night)"],
-    "Friday": ["8-11", "11-2", "2-5", "5-8", "8-11", "11-2", "2-8 (Night)"],
-    "Saturday": ["8-11", "11-2", "2-5", "5-8", "8-11", "11-2", "2-8 (Night)"],
-    "Sunday": ["8-11", "11-2", "2-5", "8-11", "11-2", "2-8 (Night)"]
+    "Monday": ["08:00-11:00", "11:00-14:00", "14:00-17:00", "17:00-20:00", "20:00-23:00", "23:00-02:00", "02:00-08:00 (Night)"],
+    "Tuesday": ["08:00-11:00", "11:00-14:00", "14:00-17:00", "17:00-20:00", "20:00-23:00", "23:00-02:00", "02:00-08:00 (Night)"],
+    "Wednesday": ["08:00-11:00", "11:00-14:00", "14:00-17:00", "17:00-20:00", "20:00-23:00", "23:00-02:00", "02:00-08:00 (Night)"],
+    "Thursday": ["08:00-11:00", "11:00-14:00", "14:00-17:00", "17:00-20:00", "20:00-23:00", "23:00-02:00", "02:00-08:00 (Night)"],
+    "Friday": ["08:00-11:00", "11:00-14:00", "14:00-17:00", "17:00-20:00", "20:00-23:00", "23:00-02:00", "02:00-08:00 (Night)"],
+    "Saturday": ["08:00-11:00", "11:00-14:00", "14:00-17:00", "17:00-20:00", "20:00-23:00", "23:00-02:00", "02:00-08:00 (Night)"],
+    "Sunday": ["08:00-11:00", "11:00-14:00", "14:00-17:00", "17:00-20:00", "20:00-23:00", "23:00-02:00", "02:00-08:00 (Night)"],
 }
 
-# Define shift requirements per shift label (each instance inherits these).
+# Define updated shift requirements per shift label.
 shift_requirements = {
-    "8-11": {"needed": 3, "drivers": 2},
-    "11-2": {"needed": 2, "drivers": 1},
-    "2-5": {"needed": 3, "drivers": 2},
-    "5-8": {"needed": 3, "drivers": 2},
-    "2-8 (Night)": {"needed": 2, "drivers": 1},  # Rotating night shift requirement
+    "08:00-11:00": {"needed": 3, "drivers": 2},
+    "11:00-14:00": {"needed": 3, "drivers": 2},
+    "14:00-17:00": {"needed": 3, "drivers": 2},
+    "17:00-20:00": {"needed": 3, "drivers": 2},
+    "20:00-23:00": {"needed": 3, "drivers": 2},
+    "23:00-02:00": {"needed": 3, "drivers": 2},
+    "02:00-08:00 (Night)": {"needed": 2, "drivers": 1},  # Rotating night shift requirement
 }
 
 # Initialize model
@@ -43,6 +62,14 @@ for student in students:
             schedule[(student["name"], day, idx, shift)] = model.NewBoolVar(
                 f"{student['name']}_{day}_{shift}_{idx}"
             )
+
+# For each student, day, and shift instance, force schedule to 0 if the student is not available.
+for student in students:
+    for day, shift_list in shifts_per_day.items():
+        available_shifts = student["availability"].get(day, [])
+        for idx, shift in enumerate(shift_list):
+            if shift not in available_shifts:
+                model.Add(schedule[(student["name"], day, idx, shift)] == 0)
 
 # Slack variables for soft constraints on meeting required available and driver counts.
 slack_avail = {}
@@ -83,24 +110,24 @@ for s in students:
     model.Add(student_load[s["name"]] <= max_load)
     model.Add(student_load[s["name"]] >= min_load)
 
-# Prevent any student from working consecutive night shifts ("2-8 (Night)")
+# Prevent any student from working consecutive night shifts ("02:00-08:00 (Night)")
 # For each student and consecutive days, the sum of assignments over all night shift instances is <= 1.
 days = list(shifts_per_day.keys())
 for i in range(len(days) - 1):
     day1 = days[i]
     day2 = days[i+1]
     # Get indices (could be more than one occurrence of night shift per day)
-    night_indices_day1 = [idx for idx, shift in enumerate(shifts_per_day[day1]) if shift == "2-8 (Night)"]
-    night_indices_day2 = [idx for idx, shift in enumerate(shifts_per_day[day2]) if shift == "2-8 (Night)"]
+    night_indices_day1 = [idx for idx, shift in enumerate(shifts_per_day[day1]) if shift == "02:00-08:00 (Night)"]
+    night_indices_day2 = [idx for idx, shift in enumerate(shifts_per_day[day2]) if shift == "02:00-08:00 (Night)"]
     for s in students:
-        assignments_day1 = [schedule[(s["name"], day1, idx, "2-8 (Night)")] for idx in night_indices_day1]
-        assignments_day2 = [schedule[(s["name"], day2, idx, "2-8 (Night)")] for idx in night_indices_day2]
+        assignments_day1 = [schedule[(s["name"], day1, idx, "02:00-08:00 (Night)")] for idx in night_indices_day1]
+        assignments_day2 = [schedule[(s["name"], day2, idx, "02:00-08:00 (Night)")] for idx in night_indices_day2]
         model.Add(sum(assignments_day1) + sum(assignments_day2) <= 1)
 
 # NEW: Add maximum staffing constraints for each shift instance.
 for day, shift_list in shifts_per_day.items():
     for idx, shift in enumerate(shift_list):
-        cap = 2 if shift == "2-8 (Night)" else 3
+        cap = 2 if shift == "02:00-08:00 (Night)" else 3
         model.Add(sum(schedule[(s["name"], day, idx, shift)] for s in students) <= cap)
 
 # Ensure each student gets at most one shift per day.
@@ -146,3 +173,53 @@ output_file_path = "schedule_output.xlsx"
 df.to_excel(output_file_path, index=False)
 
 print(f"Schedule saved to {output_file_path}")
+
+# New: Check for scheduling conflicts
+import pandas as pd
+
+conflicts = []
+
+# Load students availability from CSV into a lookup dictionary.
+students_avail_df = pd.read_csv("processed_student_availability.csv")
+availability_lookup = {}
+for _, row in students_avail_df.iterrows():
+    # Convert the string representation back to a dictionary.
+    availability_lookup[row["name"]] = eval(row["availability"])
+
+# Load the generated schedule from Excel.
+schedule_df = pd.read_excel("schedule_output.xlsx")
+
+# Check for class conflicts (student assigned when not available)
+for _, row in schedule_df.iterrows():
+    day = row["Day"]
+    shift = row["Shift"]
+    assigned = row["Assigned"]
+    if pd.isna(assigned) or assigned.strip() == "":
+        continue
+    # Split the assigned students from the generated schedule.
+    assigned_students = [s.strip() for s in assigned.split(",") if s.strip()]
+    for student in assigned_students:
+        if shift not in availability_lookup.get(student, {}).get(day, []):
+            conflicts.append(f"Conflict: {student} assigned to shift {shift} on {day} but not available (might be in class).")
+
+# Check that no student is assigned more than one shift in the same day.
+# We'll aggregate assignments per day.
+for day, group in schedule_df.groupby("Day"):
+    daily_assignments = {}
+    for _, row in group.iterrows():
+        assigned = row["Assigned"]
+        if pd.isna(assigned) or assigned.strip() == "":
+            continue
+        assigned_students = [s.strip() for s in assigned.split(",") if s.strip()]
+        for student in assigned_students:
+            daily_assignments[student] = daily_assignments.get(student, 0) + 1
+            if daily_assignments[student] > 1:
+                conflicts.append(f"Conflict: {student} has more than one shift on {day}.")
+
+if conflicts:
+    print("\nScheduling Conflicts Detected:")
+    for conflict in conflicts:
+        print(conflict)
+else:
+    print("\nNo scheduling conflicts detected.")
+
