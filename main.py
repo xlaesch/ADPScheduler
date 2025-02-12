@@ -31,6 +31,10 @@ with open(csv_file, newline='') as f:
                 avail_clean[day] = {"20:00-23:00", "23:00-2:00"}
         student_availability[name] = avail_clean
 
+# Debug: Print student availability
+for student, availability in student_availability.items():
+    print(f"Availability for {student}: {availability}")
+
 # =============================================================================
 days = all_days
 
@@ -68,6 +72,10 @@ for d in days:
         shift_desired[(d, "23:00-2:00")] = 0
         shift_driver_desired[(d, "23:00-2:00")] = 0
 
+# Debug: Print desired shifts
+for (day, shift), desired in shift_desired.items():
+    print(f"Desired for {day} {shift}: {desired} students, {shift_driver_desired[(day, shift)]} drivers")
+
 # =============================================================================
 model = cp_model.CpModel()
 
@@ -102,6 +110,13 @@ for d in days:
             model.Add(slack[(d, sh)] == 3 - assigned_sum[(d, sh)])
             missing[(d, sh)] = model.NewIntVar(0, 2, f"missing_{d}_{sh}")
             model.AddMaxEquality(missing[(d, sh)], [2 - assigned_sum[(d, sh)], 0])
+
+# Debug: Print constraints
+print("Constraints added to the model:")
+for d in days:
+    for sh in shifts:
+        if (d, sh) in assigned_sum:
+            print(f"  {d} {sh}: assigned_sum <= 3, slack = 3 - assigned_sum, missing = max(0, 2 - assigned_sum)")
 
 # =============================================================================
 for d in days:
@@ -139,9 +154,16 @@ for s in students:
 max_possible_shifts = len(days) * len(shifts)
 total_shifts = {}
 for s in students:
-    rel_vars = [assignment[(s, d, sh)] for d in days for sh in shifts if (s, d, sh) in assignment]
+    weighted_assignments = []
+    for d in days:
+        for sh in shifts:
+            if (s, d, sh) in assignment:
+                if sh == "02:00-08:00":
+                    weighted_assignments.append(2 * assignment[(s, d, sh)])
+                else:
+                    weighted_assignments.append(assignment[(s, d, sh)])
     total_shifts[s] = model.NewIntVar(0, max_possible_shifts, f"total_shifts_{s}")
-    model.Add(total_shifts[s] == sum(rel_vars))
+    model.Add(total_shifts[s] == sum(weighted_assignments))
 
 max_shifts = model.NewIntVar(0, max_possible_shifts, "max_shifts")
 min_shifts = model.NewIntVar(0, max_possible_shifts, "min_shifts")
@@ -193,6 +215,13 @@ if status in (cp_model.FEASIBLE, cp_model.OPTIMAL):
     print("\nObjective value:", solver.ObjectiveValue())
 else:
     print("No feasible solution was found.")
+    # Debug: Print variable values
+    for s in students:
+        for d in days:
+            for sh in shifts:
+                key = (s, d, sh)
+                if key in assignment:
+                    print(f"Assignment {key}: {solver.Value(assignment[key])}")
 
 # =============================================================================
 def check_schedule_conflicts(solver, assignment, students, days, shifts, student_availability):
