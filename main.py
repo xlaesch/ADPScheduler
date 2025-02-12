@@ -1,6 +1,7 @@
 import csv
 import ast
 from ortools.sat.python import cp_model
+import xlsxwriter
 
 # =============================================================================
 students = []
@@ -241,3 +242,41 @@ def check_schedule_conflicts(solver, assignment, students, days, shifts, student
         print("\nNo scheduling conflicts found.")
 
 check_schedule_conflicts(solver, assignment, students, days, shifts, student_availability)
+
+# =============================================================================
+
+def to_12h(shift):
+    """Convert 'HH:MM-HH:MM' to 12-hour format."""
+    def fmt(t):
+        h, m = t.split(":")
+        h = int(h)
+        suffix = "AM" if h < 12 else "PM"
+        h = h if 0 < h <= 12 else abs(h - 12) if 0 < (h - 12) < 12 else (12 if h in [0,12] else (h-12))
+        return f"{h}:{m}{suffix}"
+    start, end = shift.split("-")
+    return f"{fmt(start)} - {fmt(end)}"
+
+# Write schedule to xlsx
+workbook = xlsxwriter.Workbook('shift_schedule.xlsx')
+worksheet = workbook.add_worksheet('Schedule')
+
+row = 0
+worksheet.write(row, 0, "Day")
+worksheet.write(row, 1, "Shift")
+worksheet.write(row, 2, "Assigned")
+row += 1
+
+if status in (cp_model.FEASIBLE, cp_model.OPTIMAL):
+    for d in days:
+        for sh in shifts:
+            if shift_desired[(d, sh)] == 0:
+                continue
+            assigned_students = []
+            for s in students:
+                if (s, d, sh) in assignment and solver.Value(assignment[(s, d, sh)]) == 1:
+                    assigned_students.append(s + (" (D)" if student_can_drive[s] else ""))
+            worksheet.write(row, 0, d)
+            worksheet.write(row, 1, to_12h(sh))
+            worksheet.write(row, 2, ", ".join(assigned_students))
+            row += 1
+workbook.close()
