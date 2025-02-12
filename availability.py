@@ -22,4 +22,4 @@ def get_available_people(day, time_slot):
 
 # Example usage
 if __name__ == "__main__":
-    print(get_available_people("Thursday", "11:00-14:00"))
+    print(get_available_people("Monday", "11:00-14:00"))
