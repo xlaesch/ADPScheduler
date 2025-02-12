@@ -143,7 +143,7 @@ for d in days:
 for s in students:
     night_vars = [assignment[(s, d, "02:00-08:00")] for d in days if (s, d, "02:00-08:00") in assignment]
     if night_vars:
-        model.Add(sum(night_vars) <= 1)
+        model.Add(sum(night_vars) <= 2)  # Allow up to two night shifts per week
 
 # Add this constraint so each student has at most one shift per day
 for s in students:
